@@ -6,11 +6,27 @@ tolerance: no prefixes, no fuzzy matches, no whitespace cleanup, and no
 Unicode normalization.
 """
 
-import fnmatch
-import json
-import re
+from collections.abc import Mapping
 
 
+_ASCII_WHITESPACE = " \t\n\r\v\f"
+_ASCII_FOLD = str.maketrans(
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+    "abcdefghijklmnopqrstuvwxyz",
+)
+
+
+def _ascii_lower(value: str) -> str:
+    """ASCII-only case folding: A-Z -> a-z, everything else untouched."""
+    return value.translate(_ASCII_FOLD)
+
+
+def _has_whitespace(segment: str) -> bool:
+    return any(ch in segment for ch in _ASCII_WHITESPACE)
+
+
+# Defect 1: topic parsing must reject empty segments (leading/trailing/
+# consecutive dots) and segments containing ASCII whitespace.
 def parse_topic(topic: str) -> list[str]:
     """Split a hierarchical topic into its segments.
 
@@ -25,9 +41,34 @@ def parse_topic(topic: str) -> list[str]:
     - The wildcard tokens * and ** are returned as ordinary segment strings.
       Their special meaning is defined only by pattern_match.
     """
-    raise NotImplementedError("parse_topic")
+    if not isinstance(topic, str):
+        raise TypeError("topic must be a string")
+    segments = topic.split(".")
+    for segment in segments:
+        if segment == "":
+            raise ValueError(f"invalid topic {topic!r}: empty segment")
+        if _has_whitespace(segment):
+            raise ValueError(f"invalid topic {topic!r}: whitespace in segment")
+    return segments
 
 
+def _parse_pattern(pattern: str) -> list[str] | None:
+    """Parse a wildcard pattern.
+
+    Same structural rules as parse_topic (non-empty, whitespace-free
+    segments), but '*' and '**' are kept as ordinary segment tokens for
+    pattern_match to interpret. Returns None when the pattern is malformed.
+    """
+    if not isinstance(pattern, str):
+        return None
+    segments = pattern.split(".")
+    for segment in segments:
+        if segment == "" or _has_whitespace(segment):
+            return None
+    return segments
+
+
+# Defects 2, 3, 8: wildcard semantics and zero-tolerance matching.
 def pattern_match(pattern: str, topic: str) -> bool:
     """Return True only when the whole pattern matches the whole topic.
 
@@ -45,9 +86,99 @@ def pattern_match(pattern: str, topic: str) -> bool:
     - An invalid topic, a non-string argument, or a topic containing * or **
       returns False.
     """
-    raise NotImplementedError("pattern_match")
+    if not isinstance(pattern, str) or not isinstance(topic, str):
+        return False
+    # Topics are concrete: any wildcard token disqualifies them.
+    if "*" in topic:
+        return False
+    try:
+        topic_segments = parse_topic(topic)
+    except (TypeError, ValueError):
+        return False
+    pattern_segments = _parse_pattern(pattern)
+    if pattern_segments is None:
+        return False
+
+    # ** is only legal as the final segment.
+    if "**" in pattern_segments[:-1]:
+        return False
+
+    multilevel = pattern_segments[-1] == "**"
+    literal_count = len(pattern_segments) - 1 if multilevel else len(pattern_segments)
+
+    if multilevel:
+        # ** must consume one or more segments, never zero.
+        if len(topic_segments) <= literal_count:
+            return False
+    elif len(topic_segments) != literal_count:
+        # No prefix match: segment counts must be exactly equal.
+        return False
+
+    for index in range(literal_count):
+        token = pattern_segments[index]
+        if token == "*":
+            # Length alignment above guarantees exactly one segment.
+            continue
+        if _ascii_lower(token) != _ascii_lower(topic_segments[index]):
+            return False
+    return True
 
 
+def _rule_lists(policy: dict, section: str, principal: str):
+    """Fetch (deny_rules, allow_rules) for principal under one section.
+
+    Returns None when the policy is malformed; a missing section, map,
+    principal or rule list is represented by an empty list instead.
+    """
+    if not isinstance(policy, dict):
+        return None
+    block = policy.get(section)
+    if block is None:
+        return [], []
+    if not isinstance(block, dict):
+        return None
+
+    def _rules(kind: str):
+        rules = block.get(kind)
+        if rules is None:
+            return []
+        if not isinstance(rules, dict):
+            return None
+        entries = rules.get(principal)
+        if entries is None:
+            return []
+        if not isinstance(entries, list):
+            return None
+        return entries
+
+    allow = _rules("allow")
+    deny = _rules("deny")
+    if allow is None or deny is None:
+        return None
+    return deny, allow
+
+
+def _decide(section: str, principal: str, topic: str, policy: dict) -> bool:
+    """Deny-first, allow-second decision for a concrete topic."""
+    if not isinstance(topic, str) or "*" in topic:
+        return False
+    # Rejects invalid topics before any rule is consulted.
+    parse_topic(topic)
+    rules = _rule_lists(policy, section, principal)
+    if rules is None:
+        return False
+    deny_rules, allow_rules = rules
+    # Defect 4: deny rules are evaluated first and always win.
+    for pattern in deny_rules:
+        if pattern_match(pattern, topic):
+            return False
+    for pattern in allow_rules:
+        if pattern_match(pattern, topic):
+            return True
+    return False
+
+
+# Defect 4: subscribe honors deny rules before allow rules.
 def allow_subscribe(principal: str, topic: str, policy: dict) -> bool:
     """Decide whether principal may subscribe to a concrete topic.
 
@@ -70,9 +201,13 @@ def allow_subscribe(principal: str, topic: str, policy: dict) -> bool:
       False.
     - Subscription rules never fall back to publish or dead-letter rules.
     """
-    raise NotImplementedError("allow_subscribe")
+    try:
+        return _decide("subscribe", principal, topic, policy)
+    except (TypeError, ValueError):
+        return False
 
 
+# Defect 5: publish is governed solely by the publish section.
 def allow_publish(principal: str, topic: str, policy: dict) -> bool:
     """Decide whether principal may publish to a concrete topic.
 
@@ -91,9 +226,13 @@ def allow_publish(principal: str, topic: str, policy: dict) -> bool:
     - An invalid topic, an invalid pattern or a malformed policy returns
       False.
     """
-    raise NotImplementedError("allow_publish")
+    try:
+        return _decide("publish", principal, topic, policy)
+    except (TypeError, ValueError):
+        return False
 
 
+# Defect 6: dead-letter access requires an explicit per-queue reader grant.
 def deadletter_ok(principal: str, queue) -> bool:
     """Decide whether principal may read a dead-letter queue.
 
@@ -107,9 +246,22 @@ def deadletter_ok(principal: str, queue) -> bool:
     - Dead-letter access is always explicitly granted per queue; no wildcard
       reader matching is performed.
     """
-    raise NotImplementedError("deadletter_ok")
+    if not isinstance(principal, str) or "*" in principal:
+        return False
+    if not isinstance(queue, Mapping):
+        return False
+    readers = queue.get("readers")
+    if not isinstance(readers, list):
+        return False
+    if principal not in readers:
+        return False
+    denied = queue.get("deny_readers")
+    if isinstance(denied, list) and principal in denied:
+        return False
+    return True
 
 
+# Defect 7: subscription caps are mandatory and fail closed.
 def subscription_limit(principal: str, count: int, policy: dict) -> bool:
     """Decide whether a subscription count stays within the configured cap.
 
@@ -122,9 +274,51 @@ def subscription_limit(principal: str, count: int, policy: dict) -> bool:
     - A missing cap, a negative cap, a non-integer count or any malformed
       policy fails closed and returns False. The cap is not optional.
     """
-    raise NotImplementedError("subscription_limit")
+    if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+        return False
+    if not isinstance(policy, dict):
+        return False
+    section = policy.get("subscribe")
+    if not isinstance(section, dict):
+        return False
+    caps = section.get("max_subscriptions")
+    if not isinstance(caps, dict):
+        return False
+    try:
+        cap = caps.get(principal, caps.get("default"))
+    except TypeError:
+        return False
+    if isinstance(cap, bool) or not isinstance(cap, int) or cap < 0:
+        return False
+    return count <= cap
 
 
+def _iter_allow_patterns(policy: dict, section: str) -> list:
+    block = policy.get(section)
+    if not isinstance(block, dict):
+        return []
+    allow = block.get("allow")
+    if not isinstance(allow, dict):
+        return []
+    patterns = []
+    for entries in allow.values():
+        if isinstance(entries, list):
+            patterns.extend(entries)
+    return patterns
+
+
+def _has_broad_multilevel(patterns: list) -> bool:
+    for pattern in patterns:
+        if not isinstance(pattern, str):
+            continue
+        segments = pattern.split(".")
+        if pattern == "**" or "**" in segments[:-1]:
+            return True
+    return False
+
+
+# Defect 9: policy validation flags over-broad multilevel wildcards and
+# other structural problems.
 def validate_policy(policy: dict) -> list[str]:
     """Return a deterministic list of policy problem codes.
 
@@ -140,9 +334,59 @@ def validate_policy(policy: dict) -> list[str]:
 
     A valid policy returns an empty list. The function never mutates policy.
     """
-    raise NotImplementedError("validate_policy")
+    issues: list[str] = []
+    if not isinstance(policy, dict):
+        return ["broad_multilevel_wildcard", "missing_deadletter_allow",
+                "publish_subscribe_shared"]
+
+    broad_patterns = (
+        _iter_allow_patterns(policy, "subscribe")
+        + _iter_allow_patterns(policy, "publish")
+    )
+    if _has_broad_multilevel(broad_patterns):
+        issues.append("broad_multilevel_wildcard")
+
+    deadletter = policy.get("deadletter")
+    deadletter_allow = (
+        deadletter.get("allow") if isinstance(deadletter, dict) else None
+    )
+    if (
+        not isinstance(deadletter_allow, list)
+        or not deadletter_allow
+        or any(
+            isinstance(pattern, str) and "**" in pattern.split(".")
+            for pattern in deadletter_allow
+        )
+    ):
+        issues.append("missing_deadletter_allow")
+
+    subscribe = policy.get("subscribe")
+    publish = policy.get("publish")
+    shared = False
+    if not isinstance(publish, dict):
+        shared = True
+    elif isinstance(subscribe, dict):
+        for publish_kind, subscribe_kind in (
+            ("allow", "allow"),
+            ("deny", "deny"),
+        ):
+            publish_map = publish.get(publish_kind)
+            subscribe_map = subscribe.get(subscribe_kind)
+            if (
+                isinstance(publish_map, dict)
+                and isinstance(subscribe_map, dict)
+                and (publish_map is subscribe_map or publish_map == subscribe_map)
+            ):
+                shared = True
+                break
+    if shared:
+        issues.append("publish_subscribe_shared")
+
+    return issues
 
 
+# Defect 10: every batch request is evaluated independently with no shared
+# match state, parsed topic or decision.
 def queue_batch(requests, policy: dict) -> dict:
     """Evaluate independent ACL requests and return id-to-boolean results.
 
@@ -161,4 +405,43 @@ def queue_batch(requests, policy: dict) -> dict:
       Requests without a usable string id are skipped.
     - Every usable id appears exactly once in the returned dictionary.
     """
-    raise NotImplementedError("queue_batch")
+    results: dict[str, bool] = {}
+    try:
+        iterator = iter(requests)
+    except TypeError:
+        return results
+
+    for request in iterator:
+        if not isinstance(request, Mapping):
+            continue
+        request_id = request.get("id")
+        if not isinstance(request_id, str) or request_id == "":
+            continue
+
+        action = request.get("action")
+        try:
+            if action == "subscribe":
+                principal = request.get("principal")
+                decision = allow_subscribe(
+                    principal, request.get("topic"), policy
+                )
+                if decision and "count" in request:
+                    decision = subscription_limit(
+                        principal, request.get("count"), policy
+                    )
+            elif action == "publish":
+                decision = allow_publish(
+                    request.get("principal"), request.get("topic"), policy
+                )
+            elif action == "deadletter":
+                decision = deadletter_ok(
+                    request.get("principal"), request.get("queue")
+                )
+            else:
+                decision = False
+        except (TypeError, ValueError, KeyError, AttributeError):
+            decision = False
+
+        results[request_id] = decision
+
+    return results
